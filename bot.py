@@ -1,5 +1,6 @@
 import os
 import threading
+import html
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Простейший HTTP-сервер, чтобы Render видел открытый порт и UptimeRobot мог его будить
@@ -10,7 +11,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is active and running!")
         
     def log_message(self, format, *args):
-        # Отключаем лишние логи сервера в консоли, чтобы не засорять вывод
+        # Отключаем лишние логи сервера в консоли
         pass
 
 def start_web_server():
@@ -19,7 +20,7 @@ def start_web_server():
     server.serve_forever()
 
 # Запускаем веб-сервер в фоновом потоке сразу при старте файла
-threading.Thread(target=start_web_server, daemon=True).start()import html
+threading.Thread(target=start_web_server, daemon=True).start()
 import logging
 import os
 
