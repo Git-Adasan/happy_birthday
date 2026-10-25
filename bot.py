@@ -1,28 +1,8 @@
-import os
-import threading
 import html
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# Простейший HTTP-сервер, чтобы Render видел открытый порт и UptimeRobot мог его будить
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is active and running!")
-        
-    def log_message(self, format, *args):
-        # Отключаем лишние логи сервера в консоли
-        pass
-
-def start_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
-
-# Запускаем веб-сервер в фоновом потоке сразу при старте файла
-threading.Thread(target=start_web_server, daemon=True).start()
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 try:  # локальный запуск: читаем .env, если он есть
     from dotenv import load_dotenv
@@ -709,7 +689,30 @@ async def on_error(update, context):
     log.exception("Ошибка", exc_info=context.error)
 
 
+def start_health_server():
+    """Render Web Service требует открытый порт. Локально (без PORT) не запускается."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        do_HEAD = do_GET
+
+        def log_message(self, *args):
+            pass
+
+    threading.Thread(target=HTTPServer(("0.0.0.0", int(port)), Handler).serve_forever,
+                     daemon=True).start()
+    log.info("Health-сервер на порту %s", port)
+
+
 def main():
+    start_health_server()
     app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
     def cmd(name, fn):
