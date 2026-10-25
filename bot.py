@@ -1,4 +1,5 @@
 import csv
+import difflib
 import html
 import io
 import logging
@@ -43,6 +44,148 @@ from core import (
     table, years_text, has_birth_year, birth_str,
 )
 from greetings import STYLES, make_greeting
+from contextvars import ContextVar
+import secrets
+
+from telegram.ext import TypeHandler
+
+# ---------- категории, которые пользователь меняет сам ----------
+DEFAULT_CATS = dict(CATEGORIES)          # стартовый набор из core.py
+_core_find_category = find_category
+_cats_var: ContextVar = ContextVar("cats", default=None)
+_cat_cache: dict = {}
+MAX_CATS = 20
+CATS_SQL = ("CREATE TABLE IF NOT EXISTS bot_categories ("
+            "chat_id BIGINT NOT NULL, key TEXT NOT NULL, emoji TEXT NOT NULL, title TEXT NOT NULL, "
+            "pos INT NOT NULL DEFAULT 0, PRIMARY KEY (chat_id, key))")
+
+
+def cats() -> dict:
+    """Категории текущего чата: {ключ: (эмодзи, название)}. 'other' всегда последний."""
+    return _cats_var.get() or DEFAULT_CATS
+
+
+def cat_label(key: str) -> str:
+    c = cats()
+    emoji, title = c.get(key) or c.get("other") or ("📌", "Другое")
+    return f"{emoji} {title}"
+
+
+def cat_emoji(key: str) -> str:
+    c = cats()
+    return (c.get(key) or c.get("other") or ("📌", ""))[0]
+
+
+def find_category(text: str):
+    t = text.strip().casefold()
+    if len(t) < 3:
+        return None
+    for k, (_, title) in cats().items():
+        tl = title.casefold()
+        if t == tl or tl.startswith(t) or t in tl:
+            return k
+    k = _core_find_category(t)           # старые алиасы: «друзья», «вуз»...
+    return k if k in cats() else None
+
+
+async def get_cats(chat: int) -> dict:
+    if chat in _cat_cache:
+        return _cat_cache[chat]
+    q = "SELECT key, emoji, title FROM bot_categories WHERE chat_id=$1 ORDER BY pos, title"
+    rows = await db.pool.fetch(q, chat)
+    if not rows:  # первый раз: копируем стандартный набор, дальше пользователь меняет его сам
+        for i, (k, (e, t)) in enumerate(DEFAULT_CATS.items()):
+            await db.pool.execute("INSERT INTO bot_categories (chat_id,key,emoji,title,pos) VALUES ($1,$2,$3,$4,$5) "
+                                  "ON CONFLICT DO NOTHING", chat, k, e, t, i)
+        rows = await db.pool.fetch(q, chat)
+    d = {r["key"]: (r["emoji"], r["title"]) for r in rows}
+    if "other" not in d:
+        await db.pool.execute("INSERT INTO bot_categories (chat_id,key,emoji,title,pos) VALUES ($1,'other',$2,$3,999) "
+                              "ON CONFLICT DO NOTHING", chat, *DEFAULT_CATS["other"])
+        d["other"] = DEFAULT_CATS["other"]
+    d["other"] = d.pop("other")           # «Другое» всегда внизу
+    _cat_cache[chat] = d
+    return d
+
+
+async def refresh_cats(chat: int):
+    _cat_cache.pop(chat, None)
+    _cats_var.set(await get_cats(chat))
+
+
+async def load_cats_mw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перед любым обработчиком подгружаем категории чата."""
+    if update.effective_chat:
+        _cats_var.set(await get_cats(update.effective_chat.id))
+
+
+def split_emoji(text: str):
+    """'🏠 Общежитие' -> ('🏠', 'Общежитие'); 'Общежитие' -> (None, 'Общежитие')."""
+    t = " ".join(text.split())
+    first, _, rest = t.partition(" ")
+    if rest and not any(ch.isalnum() for ch in first) and len(first) <= 8:
+        return first, rest.strip()
+    return None, t
+
+
+def _check_title(chat_cats: dict, title: str, skip_key=None):
+    if not 1 <= len(title) <= 30:
+        return "Название должно быть от 1 до 30 символов. Попробуй ещё раз."
+    for k, (_, t) in chat_cats.items():
+        if k != skip_key and t.casefold() == title.casefold():
+            return f"Категория «{t}» уже есть. Придумай другое название."
+    return None
+
+
+async def add_category(chat: int, text: str):
+    emoji, title = split_emoji(text)
+    cur = await get_cats(chat)
+    if len(cur) >= MAX_CATS:
+        return False, f"Можно не больше {MAX_CATS} категорий. Удали ненужную."
+    err = _check_title(cur, title)
+    if err:
+        return False, err
+    key = "c" + secrets.token_hex(3)
+    await db.pool.execute(
+        "INSERT INTO bot_categories (chat_id,key,emoji,title,pos) "
+        "SELECT $1::bigint, $2::text, $3::text, $4::text, COALESCE(MAX(pos) FILTER (WHERE key<>'other'),0)+1 "
+        "FROM bot_categories WHERE chat_id=$1::bigint", chat, key, emoji or "🏷", title)
+    await refresh_cats(chat)
+    return True, key
+
+
+async def rename_category(chat: int, key: str, text: str):
+    emoji, title = split_emoji(text)
+    cur = await get_cats(chat)
+    if key not in cur:
+        return False, "Такой категории уже нет."
+    err = _check_title(cur, title, skip_key=key)
+    if err:
+        return False, err
+    await db.pool.execute("UPDATE bot_categories SET emoji=$3, title=$4 WHERE chat_id=$1 AND key=$2",
+                          chat, key, emoji or cur[key][0], title)
+    await refresh_cats(chat)
+    return True, key
+
+
+async def delete_category(chat: int, key: str):
+    if key == "other":
+        return
+    await db.pool.execute("UPDATE people SET category='other' WHERE chat_id=$1 AND category=$2", chat, key)
+    await db.pool.execute("DELETE FROM bot_categories WHERE chat_id=$1 AND key=$2", chat, key)
+    await refresh_cats(chat)
+
+
+async def export_csv_labeled(chat: int) -> bytes:
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Имя", "Дата рождения", "Категория", "Год известен", "Заметка"])
+    for p in sorted(await db.list_people(chat), key=lambda p: (p["birth"], p["name"])):
+        hy = p.get("has_year", True)
+        w.writerow([p["name"], p["birth"].strftime("%d.%m.%Y" if hy else "%d.%m"),
+                    (cats().get(p["category"]) or cats()["other"])[1], "Да" if hy else "Нет", p.get("note", "")])
+    return out.getvalue().encode("utf-8-sig")
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("birthday-bot")
@@ -83,6 +226,7 @@ WELCOME = (
     "📤 экспорт списка в CSV\n"
     "📝 заметки для каждого человека\n"
     "✍️ просто напиши имя — проверю, есть ли человек в базе\n"
+    "🏷 свои категории: 👥 Категории → ➕ Новая категория\n"
     "📥 пришли файл Google Календаря или Контактов (/import) — перенесу дни рождения\n\n"
     "Чтобы начать, нажми <b>➕ Добавить</b> или просто отправь дату "
     "в формате <code>ДД.ММ.ГГГГ</code> или <code>ДД.ММ</code>, например <code>18.01.2007</code>."
@@ -122,7 +266,7 @@ def by_upcoming(people, today):
 
 
 def person_btn_label(p) -> str:
-    return f"{CATEGORIES.get(p['category'], CATEGORIES['other'])[0]} {p['name']} · {birth_str(p)}"
+    return f"{cat_emoji(p['category'])} {p['name']} · {birth_str(p)}"
 
 
 def picker_kb(people, action: str, page: int = 0):
@@ -140,7 +284,7 @@ def picker_kb(people, action: str, page: int = 0):
 
 
 def category_kb(prefix: str):
-    keys = list(CATEGORIES)
+    keys = list(cats())
     rows = [[Btn(cat_label(k), callback_data=f"{prefix}:{k}")] for k in keys]
     return Kb(rows)
 
@@ -276,7 +420,7 @@ async def add_bulk(update, context, text: str):
         lines.append(f"\n⚠️ Не разобрал строк: {len(bad)}")
         lines += [f"<code>{esc(b_[:60])}</code>" for b_ in bad[:5]]
     lines.append("\nВ какую категорию добавить?")
-    rows = chunk_buttons([Btn(cat_label(k), callback_data=f"bk:{k}") for k in CATEGORIES], 2)
+    rows = chunk_buttons([Btn(cat_label(k), callback_data=f"bk:{k}") for k in cats()], 2)
     rows.append([Btn("✖️ Отмена", callback_data="bk:c")])
     await reply(update, "\n".join(lines), Kb(rows))
 
@@ -325,11 +469,12 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def categories_view(chat: int):
     people = await db.list_people(chat)
-    counts = {k: 0 for k in CATEGORIES}
+    counts = {k: 0 for k in cats()}
     for p in people:
         counts[p["category"]] = counts.get(p["category"], 0) + 1
-    rows = [[Btn(f"{cat_label(k)} · {counts.get(k, 0)}", callback_data=f"cg:{k}")] for k in CATEGORIES]
-    return "👥 <b>Категории</b>\nВыбери категорию, чтобы посмотреть людей или добавить новых:", Kb(rows)
+    rows = [[Btn(f"{cat_label(k)} · {counts.get(k, 0)}", callback_data=f"cg:{k}")] for k in cats()]
+    rows.append([Btn("➕ Новая категория", callback_data="cn")])
+    return "👥 <b>Категории</b>\nВыбери категорию или создай свою:", Kb(rows)
 
 
 async def categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,8 +494,12 @@ async def category_screen(update: Update, key: str, note: str = ""):
             lines.append(f"… и ещё {len(members) - 30}")
     else:
         lines.append("Пока никого. Нажми «➕ Добавить людей».")
+    manage = [Btn("✏️ Название", callback_data=f"cr:{key}")]
+    if key != "other":
+        manage.append(Btn("🗑 Удалить", callback_data=f"cdl:{key}"))
     kb = Kb([[Btn("➕ Добавить людей", callback_data=f"cp:{key}:0")],
-             [Btn("📋 Таблица", callback_data=f"ct:{key}"), Btn("⬅️ Категории", callback_data="cgm")]])
+             [Btn("📋 Таблица", callback_data=f"ct:{key}"), Btn("⬅️ Категории", callback_data="cgm")],
+             manage])
     await show(update, "\n".join(lines), kb)
 
 
@@ -371,7 +520,7 @@ async def category_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, ke
         return
     pages = (len(cands) + PICK_PAGE - 1) // PICK_PAGE
     page = max(0, min(page, pages - 1))
-    rows = [[Btn(("✅ " if p["id"] in sel else "⬜ ") + f"{p['name'][:30]} {CATEGORIES.get(p['category'], CATEGORIES['other'])[0]}",
+    rows = [[Btn(("✅ " if p["id"] in sel else "⬜ ") + f"{p['name'][:30]} {cat_emoji(p['category'])}",
                  callback_data=f"cx:{key}:{p['id']}:{page}")]
             for p in cands[page * PICK_PAGE:(page + 1) * PICK_PAGE]]
     nav = []
@@ -407,7 +556,7 @@ async def upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- поиск / правка / удаление ----------
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
-        await do_search(update, " ".join(context.args))
+        await smart_lookup(update, context, " ".join(context.args))
         return
     context.user_data.clear()
     context.user_data["mode"] = "search"
@@ -569,7 +718,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await db.list_people(update.effective_chat.id):
         data = b""
     else:
-        data = await db.export_csv(update.effective_chat.id)
+        data = await export_csv_labeled(update.effective_chat.id)
     if data == b"":
         await reply(update, "📤 Экспорт пуст: у тебя пока нет записей.")
         return
@@ -606,8 +755,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif kind == "nm":  # имя не найдено: добавить или нет
         ud = context.user_data
-        if parts[1] == "add" and ud.get("pending_name"):
-            name = ud.pop("pending_name")
+        names = ud.get("pending_names") or []
+        if parts[1] == "add" and names:
+            idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            name = names[min(idx, len(names) - 1)]
             ud.clear()
             ud.update(mode="add_date_named", name=name)
             await show(update, f"Отлично! Дата рождения для <b>{esc(name)}</b>: "
@@ -615,13 +766,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif parts[1] == "add":
             await show(update, "Напиши имя ещё раз 🙂")
         else:
-            ud.pop("pending_name", None)
+            ud.pop("pending_names", None)
             await show(update, "Хорошо, не добавляю.")
 
     elif kind == "bk":  # массовое добавление: выбрана категория
         ud = context.user_data
         items = ud.get("bulk")
-        if parts[1] == "c" or not items or parts[1] not in CATEGORIES:
+        if parts[1] == "c" or not items or parts[1] not in cats():
             ud.pop("bulk", None)
             await show(update, "Отменено." if parts[1] == "c" else "Список устарел. Пришли его ещё раз.")
             return
@@ -631,24 +782,48 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    + (f"\nУже были в базе: {dup}" if dup else ""),
                    Kb([[Btn("➕ Добавить ещё", callback_data="add_more"), Btn("👥 Категории", callback_data="cgm")]]))
 
+    elif kind == "cn":  # новая категория
+        context.user_data.clear()
+        context.user_data["mode"] = "cat_new"
+        await show(update, "Напиши название новой категории, например <code>Одноклассники</code>.\n"
+                           "Эмодзи можно поставить в начале: <code>🏠 Общежитие</code>\n\n/cancel — отмена")
+
+    elif kind == "cr" and parts[1] in cats():  # переименовать
+        context.user_data.clear()
+        context.user_data.update(mode="cat_ren", cat_key=parts[1])
+        await show(update, f"Новое название для <b>{esc(cat_label(parts[1]))}</b>?\n"
+                           "Эмодзи в начале можно поменять (<code>🏠 Общежитие</code>).\n\n/cancel — отмена")
+
+    elif kind == "cdl" and parts[1] in cats() and parts[1] != "other":
+        n = len(await db.list_people(chat, parts[1]))
+        await show(update, f"Удалить категорию <b>{esc(cat_label(parts[1]))}</b>?\n"
+                           f"Людей в ней: {n}. Они не удалятся, а перейдут в «Другое».",
+                   Kb([[Btn("🗑 Да, удалить", callback_data=f"cdy:{parts[1]}"),
+                        Btn("Отмена", callback_data=f"cg:{parts[1]}")]]))
+
+    elif kind == "cdy" and parts[1] in cats() and parts[1] != "other":
+        await delete_category(chat, parts[1])
+        text, kb = await categories_view(chat)
+        await show(update, "Категория удалена 🗑\n\n" + text, kb)
+
     elif kind == "cgm":
         text, kb = await categories_view(chat)
         await show(update, text, kb)
 
-    elif kind == "cg" and parts[1] in CATEGORIES:
+    elif kind == "cg" and parts[1] in cats():
         await category_screen(update, parts[1])
 
-    elif kind == "cp" and parts[1] in CATEGORIES:
+    elif kind == "cp" and parts[1] in cats():
         await category_picker(update, context, parts[1], int(parts[2]))
 
-    elif kind == "cx" and parts[1] in CATEGORIES:  # cx:<cat>:<pid>:<page> — отметить/снять галочку
+    elif kind == "cx" and parts[1] in cats():  # cx:<cat>:<pid>:<page> — отметить/снять галочку
         ud = context.user_data
         if ud.get("sel_cat") != parts[1]:
             ud["sel_cat"], ud["sel"] = parts[1], set()
         ud["sel"] ^= {int(parts[2])}
         await category_picker(update, context, parts[1], int(parts[3]))
 
-    elif kind == "cs" and parts[1] in CATEGORIES:  # сохранить выбранных
+    elif kind == "cs" and parts[1] in cats():  # сохранить выбранных
         ud = context.user_data
         ids = list(ud.get("sel", ())) if ud.get("sel_cat") == parts[1] else []
         for pid in ids:
@@ -983,27 +1158,200 @@ def looks_like_name(text: str) -> bool:
     return 0 < len(text) <= 60 and "\n" not in text and not any(ch.isdigit() for ch in text)
 
 
-async def name_lookup(update, context, text: str):
-    """Написали просто имя: если человек есть в базе — показываем, если нет — предлагаем добавить."""
-    chat = update.effective_chat.id
-    today = today_()
-    q = text.strip().casefold()
-    found = [p for p in await db.list_people(chat) if q in p["name"].casefold()]
-    if len(found) == 1:
-        p = found[0]
-        await reply(update, f"✅ <b>{esc(p['name'])}</b> уже есть в базе.\n\n{card_text(p, today)}", card_kb(p["id"]))
-    elif found:
-        found = by_upcoming(found, today)[:10]
-        lines = [f"✅ В базе нашёл ({len(found)}):\n"]
+# ---------- умный поиск ----------
+# Понимает: другую раскладку (Fhvfy = Арман), латиницу (arman), часть имени (рман),
+# опечатки (Арамн), казахские буквы (қ = к, ә = а ...), порядок слов.
+_KZ = str.maketrans({"ә": "а", "ғ": "г", "қ": "к", "ң": "н", "ө": "о", "ұ": "у", "ү": "у", "һ": "х", "і": "и",
+                     "ё": "е", "й": "и", "ы": "и", "э": "е", "ъ": "", "ь": ""})
+_EN2RU = dict(zip("qwertyuiop[]asdfghjkl;'zxcvbnm,.", "йцукенгшщзхъфывапролджэячсмитьбю"))
+_RU2EN = {v: k for k, v in _EN2RU.items()}
+_TR_MULTI = [("shch", "щ"), ("sch", "щ"), ("sh", "ш"), ("ch", "ч"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"),
+             ("ya", "я"), ("yu", "ю"), ("yo", "е"), ("ye", "е"), ("ph", "ф")]
+_TR_ONE = dict(a="а", b="б", c="к", d="д", e="е", f="ф", g="г", h="х", i="и", j="ж", k="к", l="л", m="м",
+               n="н", o="о", p="п", q="к", r="р", s="с", t="т", u="у", v="в", w="в", x="кс", y="й", z="з")
+_VOWELS = set("аеёиоуыэюяәіұүө")
+
+
+def _norm(text: str) -> str:
+    t = re.sub(r"[^\w\s]|_", " ", text.casefold())
+    return " ".join(t.translate(_KZ).split())
+
+
+def fix_layout(text: str) -> str:
+    """Текст набран в английской раскладке, а хотели русскую: Fhvfy -> арман."""
+    return "".join(_EN2RU.get(ch, ch) for ch in text.casefold())
+
+
+def fix_layout_ru(text: str) -> str:
+    return "".join(_RU2EN.get(ch, ch) for ch in text.casefold())
+
+
+def translit(text: str) -> str:
+    """Латиница -> кириллица по звучанию: arman -> арман."""
+    t, out, i = text.casefold(), [], 0
+    while i < len(t):
+        for lat, ru in _TR_MULTI:
+            if t.startswith(lat, i):
+                out.append(ru)
+                i += len(lat)
+                break
+        else:
+            out.append(_TR_ONE.get(t[i], t[i]))
+            i += 1
+    return "".join(out)
+
+
+def _has_lat(t): return bool(re.search(r"[a-z]", t.casefold()))
+def _has_cyr(t): return bool(re.search(r"[а-яёәғқңөұүһі]", t.casefold()))
+
+
+def query_variants(q: str):
+    """[(метка, нормализованный запрос)]: как есть + с учётом раскладки и транслита."""
+    vs = [("", _norm(q))]
+    if _has_lat(q):
+        vs += [("layout", _norm(fix_layout(q))), ("translit", _norm(translit(q)))]
+    if _has_cyr(q):
+        vs.append(("layout", _norm(translit(fix_layout_ru(q)))))
+    seen, out = set(), []
+    for label, v in vs:
+        if v and v not in seen:
+            seen.add(v)
+            out.append((label, v))
+    return out
+
+
+def _word_score(qw: str, nw: str) -> float:
+    if qw == nw:
+        return 1.0
+    if len(qw) >= 3 and nw.startswith(qw):
+        return 0.93
+    if len(qw) == 2 and nw.startswith(qw):
+        return 0.8
+    if len(qw) >= 3 and qw in nw:
+        return 0.88
+    if len(qw) >= 3 and len(nw) >= 3:
+        return difflib.SequenceMatcher(None, qw, nw).ratio()
+    return 0.0
+
+
+def _name_forms(name: str):
+    forms = {_norm(name)}
+    if _has_lat(name):
+        forms.add(_norm(translit(name)))
+    return forms
+
+
+def person_score(qv: str, name: str) -> float:
+    qws, best = qv.split(), 0.0
+    for form in _name_forms(name):
+        nws = form.split()
+        if not nws:
+            continue
+        sc = sum(max(_word_score(qw, nw) for nw in nws) for qw in qws) / len(qws)
+        best = max(best, sc)
+    return best
+
+
+def smart_find(query: str, people):
+    """Возвращает (уверенные, возможные), каждый элемент — (оценка, метка, человек)."""
+    variants = query_variants(query)
+    scored = []
+    for p in people:
+        best, via = 0.0, ""
+        for label, qv in variants:
+            sc = person_score(qv, p["name"]) * (0.97 if label else 1.0)
+            if sc > best:
+                best, via = sc, label
+        scored.append((best, via, p))
+    scored.sort(key=lambda x: (-x[0], x[2]["name"].casefold()))
+    strong = [x for x in scored if x[0] >= 0.85]
+    maybe = [x for x in scored if 0.62 <= x[0] < 0.85][:5]
+    return strong, maybe
+
+
+def _plausible(text: str) -> bool:
+    """Похоже ли на настоящее имя (а не на мусор от чужой раскладки)."""
+    for w in text.casefold().split():
+        letters = [ch for ch in w if ch.isalpha()]
+        if not letters or w[0] in "ъь" or re.search(r"(.)\1\1", w):
+            return False
+        if not 0.25 <= sum(ch in _VOWELS for ch in letters) / len(letters) <= 0.8:
+            return False
+    return True
+
+
+def _cap(text: str) -> str:
+    return " ".join(w[:1].upper() + w[1:].lower() for w in text.split())
+
+
+def name_candidates(query: str):
+    """Какие варианты имени предложить при добавлении: исправленные (если похожи на имя) и как написано."""
+    q = " ".join(query.split())[:60]
+    out = []
+    if _has_lat(q) and not _has_cyr(q):
+        # сначала транслит (Alisher -> Алишер); раскладку (Lfybzh -> Данияр) — только если транслит не похож на имя
+        for conv in (translit(q), fix_layout(q)):
+            if _has_cyr(conv) and _plausible(conv):
+                out.append(_cap(conv))
+                break
+    out.append(q)
+    return out[:3]
+
+
+def _via_note(via: str) -> str:
+    return {"layout": "⌨️ Похоже, была включена другая раскладка — я учёл это.\n",
+            "translit": "🔤 Понял запрос латиницей.\n"}.get(via, "")
+
+
+def _add_row(context, query: str):
+    names = name_candidates(query)
+    context.user_data["pending_names"] = names
+    return [[Btn(f"➕ Добавить «{n[:25]}»", callback_data=f"nm:add:{i}")] for i, n in enumerate(names)]
+
+
+async def smart_lookup(update, context, text: str):
+    """Поиск по имени для свободного текста и /search. Не нашёл — предлагает добавить."""
+    chat, today = update.effective_chat.id, today_()
+    q = text.strip()
+    strong, maybe = smart_find(q, await db.list_people(chat))
+    if strong:
+        top = strong[0]
+        note = _via_note(top[1])
+        if len(strong) == 1 or (top[0] >= 0.99 and strong[1][0] < 0.99):
+            p = top[2]
+            await reply(update, f"{note}✅ <b>{esc(p['name'])}</b> уже есть в базе.\n\n{card_text(p, today)}", card_kb(p["id"]))
+            return
+        found = [x[2] for x in strong[:10]]
+        lines = [f"{note}✅ В базе нашёл ({len(found)}):\n"]
         for p in found:
             lines.append(f"• {esc(p['name'])} — {birth_str(p)} ({days_text(days_until(p['birth'], today))})")
         kb = Kb([[Btn(person_btn_label(p), callback_data=f"pk:card:{p['id']}")] for p in found])
         await reply(update, "\n".join(lines), kb)
-    else:
-        name = text.strip()[:60]
-        context.user_data["pending_name"] = name
-        await reply(update, f"«{esc(name)}» в базе нет. Добавить?",
-                    Kb([[Btn("➕ Добавить", callback_data="nm:add"), Btn("✖️ Нет", callback_data="nm:no")]]))
+        return
+    if maybe:
+        top = maybe[0]
+        note = _via_note(top[1])
+        gap = top[0] - (maybe[1][0] if len(maybe) > 1 else 0)
+        if top[0] >= 0.72 and gap >= 0.08:  # уверенная догадка: показываем сразу карточку
+            p = top[2]
+            kb = card_kb(p["id"])
+            rows = [list(r) for r in kb.inline_keyboard] + _add_row(context, q)
+            await reply(update, f"{note}🤔 Точно такого нет. Похоже, ты искал <b>{esc(p['name'])}</b>:\n\n{card_text(p, today)}"
+                                f"\n\nЕсли это другой человек — добавь его ниже.", Kb(rows))
+            return
+        lines = [f"{note}🤔 Точно такого не нашёл. Возможно, ты имел в виду:\n"]
+        for _, _, p in maybe:
+            lines.append(f"• {esc(p['name'])} — {birth_str(p)}")
+        rows = [[Btn(person_btn_label(p), callback_data=f"pk:card:{p['id']}")] for _, _, p in maybe]
+        await reply(update, "\n".join(lines), Kb(rows + _add_row(context, q)))
+        return
+    rows = _add_row(context, q)
+    rows[-1:] = [rows[-1], [Btn("✖️ Нет", callback_data="nm:no")]]
+    await reply(update, f"«{esc(q[:60])}» в базе нет. Добавить?", Kb(rows))
+
+
+async def name_lookup(update, context, text: str):
+    await smart_lookup(update, context, text)
 
 
 # ---------- текст ----------
@@ -1032,6 +1380,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await add_bulk(update, context, text)
     elif mode == "add_name":
         await add_got_name(update, context, text)
+    elif mode == "cat_new":
+        ok, res = await add_category(chat, text)
+        if ok:
+            ud.clear()
+            await category_screen(update, res, "✅ Категория создана. Добавь в неё людей:")
+        else:
+            await reply(update, res)
+    elif mode == "cat_ren":
+        ok, res = await rename_category(chat, ud.get("cat_key", ""), text)
+        if ok:
+            ud.clear()
+            await category_screen(update, res, "✅ Название изменено")
+        else:
+            await reply(update, res)
     elif mode == "add_date_named":
         d = parse_date(text)
         if not d:
@@ -1043,7 +1405,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, "Выбери категорию кнопкой выше 👆 или /cancel")
     elif mode == "search":
         ud.clear()
-        await do_search(update, text)
+        await smart_lookup(update, context, text)
     elif mode == "edit_name":
         await db.update_person(chat, ud["id"], name=text[:60])
         p = await db.get_person(chat, ud["id"])
@@ -1152,6 +1514,7 @@ async def unpin_expired(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await db.init(DATABASE_URL)
     await db.pool.execute(PINS_SQL)
+    await db.pool.execute(CATS_SQL)
     imported = await db.import_legacy(LEGACY_JSON)
     if imported:
         log.info("Импортировано из %s: %d", LEGACY_JSON, imported)
@@ -1215,6 +1578,7 @@ def main():
     cmd("export", export_cmd)
     cmd("import", import_help)
 
+    app.add_handler(TypeHandler(Update, load_cats_mw), group=-1)  # категории чата — до остальных обработчиков
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
